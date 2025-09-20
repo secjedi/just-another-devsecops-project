@@ -1,0 +1,97 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  Analysis:
+    name: SonarQube Analysis
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for better relevancy of analysis
+      - uses: sonarsource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      # Uncomment the following lines if you want to fail the job based on Quality Gate status
+      # - uses: sonarsource/sonarqube-quality-gate-action@master
+      #   timeout-minutes: 5
+      #   env:
+      #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  Check:
+    name: Trivy Scan
+    needs: Analysis
+    runs-on: self-hosted
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Trivy Config Scan
+        run: |
+          trivy config --severity HIGH,CRITICAL Dockerfile
+      - name: Trivy Image Scan
+        run: |
+          trivy image --severity HIGH,CRITICAL --format table secjedi/devsecops-learning:latest
+        
+      - name: Trivy scanning on base image
+        run: |
+          trivy image --exit-code 1 --severity CRITICAL --format table -o trivy-image-report.html secjedi/devsecops-learning:latest
+
+  build:
+    name: Build Image and Push to DockerHub
+    needs: Check
+    runs-on: self-hosted
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Login to Docker Hub
+        run: docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build Docker Image
+        run: docker build -t secjedi/devsecops-learning:latest .
+      - name: Publish Image to Docker Hub
+        run: docker push secjedi/devsecops-learning:latest
+
+  deploy:
+    name: Deploy Docker Image
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Down Docker Compose
+        run: docker-compose -f docker.yml down
+      - name: Delete Old Container
+        run: docker rm -f flask-app || true  # Prevents errors if the container does not exist
+      - name: Delete Old Image
+        run: docker rmi secjedi/devsecops-learning:latest || true  # Prevents errors if the image does not exist
+      - name: Pull Latest Image from Docker Hub
+        run: docker pull secjedi/devsecops-learning:latest
+      - name: Trivy Image Scan
+        run: trivy image --severity HIGH,CRITICAL --format table -o trivy-image-report.html secjedi/devsecops-learning:latest
+      - name: Run Docker Compose
+        run: docker-compose -f docker.yml up -d
+
+  health-check:
+    name: Health Check
+    needs: deploy
+    runs-on: self-hosted
+    steps:
+      - name: Wait for Container Health
+        run: |
+          echo "Waiting for flask-app container to be healthy..."
+          for i in {1..10}; do
+            # Using curl to check if the /health endpoint returns a 200 status code
+            response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000 || echo "000")
+            
+            if [ "$response" -eq 200 ]; then
+              echo "Health check passed! Container is healthy."
+              exit 0
+            else
+              echo "Health check failed with status code: $response. Retrying in 5 seconds..."
+              sleep 5
+            fisec
+          done
+          echo "Health check did not pass after 10 attempts."
+          exit 1
